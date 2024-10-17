@@ -46,7 +46,9 @@ public func configure(_ app: Application) async throws {
     // Register routes
     try routes(app)
     
-    scheduleFetchingCoins(app)
+    if app.environment != .testing {
+        scheduleFetchingCoins(app)
+    }
 
     // Register for sending push notifications (if needed)
     //try configureAPNS(app)
@@ -66,14 +68,17 @@ private func scheduleFetchingCoins(_ app: Application, maxPages: Int = 10, perPa
 }
 
 private func fetchMultiplePages(request: Request, controller: CoinScannerController, maxPages: Int, perPage: Int) -> EventLoopFuture<Void> {
-    var futures: [EventLoopFuture<Void>] = []
+    var future: EventLoopFuture<Void> = request.eventLoop.makeSucceededFuture(())
     
     for page in 1...maxPages {
-        let future = controller.fetchCoins(on: request, page: page, perPage: perPage)
-        futures.append(future)
+        future = future.flatMap {
+            controller.fetchCoins(on: request, page: page, perPage: perPage)
+        }.flatMap {
+            return request.eventLoop.scheduleTask(in: .seconds(1)) {}.futureResult
+        }
     }
     
-    return request.eventLoop.flatten(futures).transform(to: ())
+    return future
 }
 
 //private func configureAPNS(_ app: Application) throws {
