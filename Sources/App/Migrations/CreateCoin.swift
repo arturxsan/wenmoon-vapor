@@ -12,7 +12,7 @@ struct CreateCoin: AsyncMigration {
             .field("price_change_percentage_24h", .double)
             .create()
     }
-
+    
     func revert(on database: Database) async throws {
         try await database.schema("coins").delete()
     }

@@ -2,12 +2,14 @@ import Fluent
 import Vapor
 
 func routes(_ app: Application) throws {
-    
     // MARK: - Coins
-    
     app.get("coins") { req -> EventLoopFuture<[Coin]> in
         let page = (try? req.query.get(Int.self, at: "page")) ?? 1
         let perPage = (try? req.query.get(Int.self, at: "per_page")) ?? 250
+        
+        guard page > 0, perPage > 0 else {
+            return req.eventLoop.makeFailedFuture(Abort(.badRequest, reason: "Page and per_page must be positive integers."))
+        }
         
         let lowerBound = (page - 1) * perPage
         let upperBound = lowerBound + perPage
@@ -54,6 +56,7 @@ func routes(_ app: Application) throws {
     }
     
     // MARK: - Price Alerts
+    let headers = HTTPHeaders([("content-type", "application/json")])
     
     app.get("price-alerts") { req -> EventLoopFuture<[PriceAlert]> in
         guard let deviceToken = req.headers.first(name: "X-Device-ID") else {
@@ -67,8 +70,13 @@ func routes(_ app: Application) throws {
     app.post("price-alert") { req -> EventLoopFuture<Response> in
         do {
             let priceAlert = try req.content.decode(PriceAlert.self)
+            
             guard !priceAlert.coinID.isEmpty else {
                 throw Abort(.badRequest, reason: "coin_id parameter must not be empty")
+            }
+            
+            guard priceAlert.targetPrice > 0 else {
+                throw Abort(.badRequest, reason: "target_price must be greater than zero")
             }
             
             guard let deviceToken = req.headers.first(name: "X-Device-ID") else {
@@ -76,27 +84,18 @@ func routes(_ app: Application) throws {
             }
             
             priceAlert.deviceToken = deviceToken
+            
             return PriceAlert.query(on: req.db)
                 .filter(\.$deviceToken == deviceToken)
                 .filter(\.$coinID == priceAlert.coinID)
-                .count()
-                .flatMap { count in
-                    let headers = HTTPHeaders([("content-type", "application/json")])
-                    
-                    let body: Data
-                    do {
-                        let encoder = JSONEncoder()
-                        body = try encoder.encode(priceAlert)
-                    } catch {
-                        return req.eventLoop.makeFailedFuture(Abort(.internalServerError))
-                    }
-                    
-                    guard count == .zero else {
-                        let response = Response(status: .ok, headers: headers, body: .init(data: body))
-                        return req.eventLoop.makeSucceededFuture(response)
-                    }
-                    return priceAlert.save(on: req.db).flatMapThrowing {
-                        Response(status: .ok, headers: headers, body: .init(data: body))
+                .first()
+                .flatMap { existingPriceAlert in
+                    if existingPriceAlert != nil {
+                        return req.eventLoop.makeFailedFuture(Abort(.conflict, reason: "Price alert already exists for this coin and device."))
+                    } else {
+                        return priceAlert.save(on: req.db).flatMapThrowing {
+                            return Response(status: .ok, headers: headers, body: .init(data: try JSONEncoder().encode(priceAlert)))
+                        }
                     }
                 }
         } catch {
@@ -118,7 +117,6 @@ func routes(_ app: Application) throws {
             .filter(\.$coinID == coinID)
             .first()
             .flatMap { priceAlert -> EventLoopFuture<Response> in
-                let headers = HTTPHeaders([("content-type", "application/json")])
                 guard let priceAlert else {
                     return req.eventLoop.makeFailedFuture(Abort(.notFound,
                                                                 headers: headers,

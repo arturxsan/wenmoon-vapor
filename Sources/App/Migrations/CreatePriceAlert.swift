@@ -11,7 +11,7 @@ struct CreatePriceAlert: AsyncMigration {
             .field("device_token", .string)
             .create()
     }
-
+    
     func revert(on database: Database) async throws {
         try await database.schema("price_alerts").delete()
     }
