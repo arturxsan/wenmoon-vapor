@@ -104,6 +104,18 @@ func routes(_ app: Application) throws {
         return provider.fetchOHLCData(symbol: symbol, currency: currency, req: req)
     }
     
+    // MARK: - Global Market Data
+    app.get("global-market-data") { req -> EventLoopFuture<GlobalMarketData> in
+        GlobalMarketData.query(on: req.db)
+            .first()
+            .flatMapThrowing { globalData -> GlobalMarketData in
+                guard let globalData else {
+                    throw Abort(.notFound, reason: "No global market data found")
+                }
+                return globalData
+            }
+    }
+    
     // MARK: - Price Alerts
     let headers = HTTPHeaders([("content-type", "application/json")])
     

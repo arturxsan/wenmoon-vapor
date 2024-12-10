@@ -2,6 +2,10 @@ import Fluent
 import FluentPostgresDriver
 import Vapor
 
+struct GlobalMarketDataResponse: Codable {
+    let data: GlobalMarketData
+}
+
 enum Currency: String, Decodable {
     case usdt = "USDT"
     
@@ -41,33 +45,47 @@ final class CoinScannerController {
         totalCoins: Int = 1000,
         perPage: Int = 250,
         coinFetchInterval: TimeAmount = .minutes(30),
-        priceUpdateInterval: TimeAmount = .minutes(3)
+        priceUpdateInterval: TimeAmount = .minutes(3),
+        globalDataInterval: TimeAmount = .minutes(10)
     ) {
-        // Schedule the task for fetching and saving coins every `coinFetchInterval`
-        app.eventLoopGroup.next().scheduleRepeatedTask(initialDelay: .seconds(5), delay: coinFetchInterval) { [weak self] task in
-            let req = Request(application: app, on: app.eventLoopGroup.next())
+        let eventLoop = app.eventLoopGroup.next()
+        
+        // Task for fetching and saving coins
+        eventLoop.scheduleRepeatedTask(initialDelay: .seconds(5), delay: coinFetchInterval) { [weak self] task in
+            let req = Request(application: app, on: eventLoop)
             self?.fetchAllCoins(on: req, currency: currency, totalCoins: totalCoins, perPage: perPage)
-                .whenComplete { result in
-                    switch result {
-                    case .success:
-                        app.logger.info("Successfully fetched and saved coin data.")
-                    case .failure(let error):
-                        app.logger.error("Failed to fetch coin data: \(error)")
-                    }
+                .flatMap { message -> EventLoopFuture<Void> in
+                    app.logger.info("\(message)")
+                    return eventLoop.makeSucceededFuture(())
+                }
+                .whenFailure { error in
+                    app.logger.error("Failed to fetch coin data: \(error)")
                 }
         }
         
-        // Schedule a separate task for updating prices every `priceUpdateInterval`
-        app.eventLoopGroup.next().scheduleRepeatedTask(initialDelay: .minutes(3), delay: priceUpdateInterval) { [weak self] task in
-            let req = Request(application: app, on: app.eventLoopGroup.next())
+        // Task for updating prices
+        eventLoop.scheduleRepeatedTask(initialDelay: .minutes(3), delay: priceUpdateInterval) { [weak self] task in
+            let req = Request(application: app, on: eventLoop)
             self?.updateMarketData(for: currency, on: req)
-                .whenComplete { result in
-                    switch result {
-                    case .success:
-                        app.logger.info("Successfully updated prices for all coins.")
-                    case .failure(let error):
-                        app.logger.error("Failed to update prices: \(error)")
-                    }
+                .flatMap { _ -> EventLoopFuture<Void> in
+                    app.logger.info("Successfully updated prices for all coins.")
+                    return eventLoop.makeSucceededFuture(())
+                }
+                .whenFailure { error in
+                    app.logger.error("Failed to update prices: \(error)")
+                }
+        }
+        
+        // Task for fetching global market data
+        eventLoop.scheduleRepeatedTask(initialDelay: .seconds(10), delay: globalDataInterval) { [weak self] task in
+            let req = Request(application: app, on: eventLoop)
+            self?.fetchGlobalMarketData(on: req)
+                .flatMap { globalData -> EventLoopFuture<Void> in
+                    app.logger.info("Successfully fetched global market data.")
+                    return eventLoop.makeSucceededFuture(())
+                }
+                .whenFailure { error in
+                    app.logger.error("Failed to fetch global market data: \(error)")
                 }
         }
     }
@@ -200,6 +218,45 @@ final class CoinScannerController {
             URLQueryItem(name: "include_24hr_change", value: "true")
         ]
         return urlComponents?.url
+    }
+    
+    private func fetchGlobalMarketData(on req: Request) -> EventLoopFuture<Void> {
+        guard let url = URL(string: "https://api.coingecko.com/api/v3/global") else {
+            return req.eventLoop.makeFailedFuture(Abort(.internalServerError, reason: "Failed to create URL"))
+        }
+        
+        let headers = HTTPHeaders([("User-Agent", "VaporApp/1.0")])
+        let urlRequest = ClientRequest(method: .GET, url: URI(string: url.absoluteString), headers: headers)
+        
+        return req.client.send(urlRequest)
+            .flatMapThrowing { response in
+                guard response.status == .ok, let data = response.body else {
+                    throw Abort(.internalServerError, reason: "Failed to fetch global market data: \(response.status)")
+                }
+                
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let globalDataResponse = try decoder.decode(GlobalMarketDataResponse.self, from: Data(buffer: data))
+                let globalData = globalDataResponse.data
+                
+                return GlobalMarketData(marketCapPercentage: globalData.marketCapPercentage)
+            }
+            .flatMap { newData -> EventLoopFuture<Void> in
+                GlobalMarketData.query(on: req.db)
+                    .first()
+                    .flatMap { existingData -> EventLoopFuture<Void> in
+                        if let existingData {
+                            existingData.marketCapPercentage = newData.marketCapPercentage
+                            return existingData.update(on: req.db).map {
+                                req.logger.info("Global market data updated in database.")
+                            }
+                        } else {
+                            return newData.create(on: req.db).map {
+                                req.logger.info("New global market data saved to database.")
+                            }
+                        }
+                    }
+            }
     }
 }
 
